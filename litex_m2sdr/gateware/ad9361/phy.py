@@ -73,6 +73,16 @@ class AD9361PHY(LiteXModule):
                 ("``0b0``", "Normal operation (no loopback)"),
                 ("``0b1``", "Loopback TX data to RX internally"),
             ], description="Enables/disables internal loopback mode"),
+            CSRField("framing_clear", size=1, offset=2, values=[
+                ("``0b0``", "Framing slip counter free-running."),
+                ("``0b1``", "Hold framing slip counter cleared."),
+            ], description="Clear/hold the RX framing slip counter"),
+        ])
+        self.framing = CSRStatus(fields=[
+            CSRField("rx_frame_slips", size=16, offset=0, description=
+                "Count of RX_FRAME rising edges observed at an unexpected "
+                "counter phase (framing slips). Saturates at 0xffff; clear "
+                "via control.framing_clear."),
         ])
 
         # # #
@@ -145,6 +155,32 @@ class AD9361PHY(LiteXModule):
                 })
             )
         ]
+
+        # RX Framing Monitor.
+        # -------------------
+        # In steady state, RX_FRAME rising edges land on a fixed counter phase
+        # (rx_count[0] == 0 in 1R1T, rx_count == 0 in 2R2T). An edge anywhere
+        # else means the interface framing slipped (the realignment above
+        # self-heals the counter, but any sample assembled across the slip is
+        # corrupt); count such events for software observability.
+        framing_clear   = Signal()
+        rx_frame_slips  = Signal(16)
+        rx_frame_slip   = Signal()
+        self.specials += MultiReg(self.control.fields.framing_clear, framing_clear, odomain="rfic")
+        self.comb += rx_frame_slip.eq(
+            (rx_frame & ~rx_frame_d) & Mux(mode == AD9361PHY1R1T_MODE,
+                rx_count[0] != 0,
+                rx_count    != 0,
+            )
+        )
+        self.sync.rfic += [
+            If(framing_clear,
+                rx_frame_slips.eq(0)
+            ).Elif(rx_frame_slip & (rx_frame_slips != 2**16 - 1),
+                rx_frame_slips.eq(rx_frame_slips + 1)
+            )
+        ]
+        self.specials += MultiReg(rx_frame_slips, self.framing.fields.rx_frame_slips)
 
         # RX Data.
         # --------
