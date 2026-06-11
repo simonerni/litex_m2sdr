@@ -919,6 +919,157 @@ restore:
     return rc;
 }
 
+#ifdef CSR_AD9361_RX_DESKEW_IDELAY_ADDR
+/* Per-lane RX interface deskew at the doubled DATA_CLK rate.
+ *
+ * At 983Mbps per lane (2T2R wide-bandwidth) the board's lane-to-lane skew
+ * exceeds the eye, and the AD9361's RX delay register shifts all lanes
+ * together - so each lane gets an FPGA-side IDELAYE2 instead. The error
+ * metric: with the chip BIST PRBS in 2R2T mode both channel slots carry the
+ * same word, so the gateware counts ch1-vs-ch2 differences per lane. Sweep
+ * all taps once (counters for all lanes update in parallel), then center
+ * each lane in its widest error-free run.
+ *
+ * Only valid in 2R2T PHY mode (in 1R1T the slots are consecutive samples);
+ * callers in 1R1T skip this (their DATA_CLK also stays at the in-spec rate).
+ */
+static int m2sdr_rx_deskew_set_lane(struct m2sdr_dev *dev, unsigned lane, unsigned tap)
+{
+    return m2sdr_reg_write(dev, CSR_AD9361_RX_DESKEW_IDELAY_ADDR,
+        (tap  << CSR_AD9361_RX_DESKEW_IDELAY_VALUE_OFFSET) |
+        (lane << CSR_AD9361_RX_DESKEW_IDELAY_LANE_OFFSET)) ? M2SDR_ERR_IO : M2SDR_ERR_OK;
+}
+
+static int m2sdr_deskew_rx_lanes(struct m2sdr_dev *dev, struct ad9361_rf_phy *phy)
+{
+    /* The IDELAYE2s can only add delay and a lane shifted by a full UI lands
+     * on the wrong DDR edge, so only each lane's first eye is usable: every
+     * lane must start at-or-before its eye. Delaying the chip's DATA_CLK
+     * output (advancing all data lanes against it) moves the eyes into
+     * positive IDELAY territory; try increasing clock delays until all lanes
+     * find an error-free window. The global delay scan that follows the
+     * deskew shifts all lanes jointly, so it preserves the lane alignment. */
+    static const uint8_t clk_delays[] = {2, 3, 4, 1};
+    uint32_t errs[6][32];
+    uint8_t bist;
+    unsigned ci, tap, lane;
+    int rc = M2SDR_ERR_OK;
+
+    bist = ad9361_spi_read(phy->spi, REG_BIST_CONFIG);
+    ad9361_spi_write(phy->spi, REG_BIST_CONFIG, BIST_CTRL_POINT(2) | BIST_ENABLE);
+
+    for (ci = 0; ci < sizeof(clk_delays); ci++) {
+        unsigned center[6];
+        bool all_found = true;
+
+        ad9361_spi_write(phy->spi, REG_RX_CLOCK_DATA_DELAY, clk_delays[ci] << 4);
+        mdelay(2);
+
+        for (tap = 0; tap < 32; tap++) {
+            for (lane = 0; lane < 6; lane++) {
+                rc = m2sdr_rx_deskew_set_lane(dev, lane, tap);
+                if (rc != M2SDR_ERR_OK)
+                    goto restore;
+            }
+            /* Latch-and-clear opens the window; the second latch closes it. */
+            m2sdr_reg_write(dev, CSR_AD9361_RX_DESKEW_CTRL_ADDR, 1);
+            mdelay(2);
+            m2sdr_reg_write(dev, CSR_AD9361_RX_DESKEW_CTRL_ADDR, 1);
+            for (lane = 0; lane < 6; lane++) {
+                if (m2sdr_reg_read(dev, CSR_AD9361_RX_DESKEW_ERR0_ADDR +
+                        lane * (CSR_AD9361_RX_DESKEW_ERR1_ADDR - CSR_AD9361_RX_DESKEW_ERR0_ADDR),
+                        &errs[lane][tap]) != 0) {
+                    rc = M2SDR_ERR_IO;
+                    goto restore;
+                }
+            }
+        }
+
+        for (lane = 0; lane < 6; lane++) {
+            unsigned best_start = 0, best_run = 0, start = 0, run = 0;
+
+            for (tap = 0; tap < 32; tap++) {
+                if (errs[lane][tap] == 0) {
+                    if (run == 0)
+                        start = tap;
+                    run++;
+                    if (run > best_run) {
+                        best_run = run;
+                        best_start = start;
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+            if (best_run == 0) {
+                all_found = false;
+                break;
+            }
+            center[lane] = best_start + best_run / 2;
+            M2SDR_LOGF("RX deskew: clk %u lane %u window [%u..%u] -> tap %u.\n",
+                clk_delays[ci], lane, best_start, best_start + best_run - 1, center[lane]);
+        }
+        if (!all_found) {
+            M2SDR_LOGF("RX deskew: clk %u: lane %u has no error-free tap.\n",
+                clk_delays[ci], lane);
+            continue;
+        }
+        for (lane = 0; lane < 6; lane++) {
+            rc = m2sdr_rx_deskew_set_lane(dev, lane, center[lane]);
+            if (rc != M2SDR_ERR_OK)
+                goto restore;
+        }
+        goto restore; /* rc == M2SDR_ERR_OK */
+    }
+    rc = M2SDR_ERR_IO;
+
+restore:
+    ad9361_spi_write(phy->spi, REG_BIST_CONFIG, bist);
+    return rc;
+}
+/* TX interface tune at the doubled DATA_CLK rate.
+ *
+ * Sweeps the chip's global TX data delay (FB_CLK delay stays 0, so no ENSM
+ * round-trips that would re-roll the interface framing) and checks each
+ * point with the FPGA PRBS through the chip's data-port loopback. Candidates
+ * are ordered by measured likelihood. Requires an already-aligned RX. */
+static int m2sdr_tune_tx_delay(struct m2sdr_dev *dev, struct ad9361_rf_phy *phy)
+{
+    static const uint8_t dat_delays[] = {1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    uint32_t saved_prbs_tx = 0;
+    uint8_t obs;
+    bool synced = false;
+    unsigned di;
+    int i;
+
+    if (m2sdr_reg_read(dev, CSR_AD9361_PRBS_TX_ADDR, &saved_prbs_tx) != 0)
+        return M2SDR_ERR_IO;
+    obs = ad9361_spi_read(phy->spi, REG_OBSERVE_CONFIG);
+    ad9361_spi_write(phy->spi, REG_OBSERVE_CONFIG,
+        (uint8_t)((obs & ~DATA_PORT_SP_HD_LOOP_TEST_OE) | DATA_PORT_LOOP_TEST_ENABLE));
+
+    for (di = 0; di < sizeof(dat_delays) && !synced; di++) {
+        if (m2sdr_program_delay_reg(phy, true, 0, dat_delays[di], false) != M2SDR_ERR_OK)
+            break;
+        (void)m2sdr_write_prbs_tx_ctrl(dev, 0);
+        mdelay(2);
+        (void)m2sdr_write_prbs_tx_ctrl(dev, 1u << CSR_AD9361_PRBS_TX_ENABLE_OFFSET);
+        for (i = 0; i < 12 && !synced; i++) {
+            mdelay(5);
+            (void)m2sdr_read_prbs_synced(dev, &synced);
+        }
+        if (synced)
+            M2SDR_LOGF("TX delay tune: Clk 0, Dat %u verified.\n", dat_delays[di]);
+    }
+    if (!synced)
+        M2SDR_LOGF("TX delay tune: no working TX delay found.\n");
+
+    (void)m2sdr_write_prbs_tx_ctrl(dev, saved_prbs_tx);
+    ad9361_spi_write(phy->spi, REG_OBSERVE_CONFIG, obs);
+    return synced ? M2SDR_ERR_OK : M2SDR_ERR_IO;
+}
+#endif
+
 /* In-mode digital interface alignment verify for the wide-bandwidth mode.
  *
  * The doubled-DATA_CLK interface can come up misaligned (the capture lands
@@ -1012,9 +1163,32 @@ static int m2sdr_wide_bandwidth_bringup(struct m2sdr_dev *dev,
         if (m2sdr_from_ad9361_rc(ad9361_set_rx_sampling_freq(phy, ad9361_rate)) != M2SDR_ERR_OK)
             return M2SDR_ERR_IO;
         ad9361_enable_oversampling(phy);
+#ifdef CSR_AD9361_RX_DESKEW_IDELAY_ADDR
+        /* 2R2T at the doubled rate runs 983Mbps per lane, where lane-to-lane
+         * skew exceeds the eye; deskew per-lane before checking alignment
+         * (2R2T only: the metric needs identical words in both slots). */
+        {
+            uint32_t phy_control = 0;
+
+            (void)m2sdr_reg_read(dev, CSR_AD9361_PHY_CONTROL_ADDR, &phy_control);
+            if (!(phy_control & (1u << CSR_AD9361_PHY_CONTROL_MODE_OFFSET)))
+                (void)m2sdr_deskew_rx_lanes(dev, phy);
+        }
+#endif
         rc = m2sdr_wide_bandwidth_verify(dev);
         if (rc == M2SDR_ERR_OK) {
             M2SDR_LOGF("Wide-bandwidth interface verified aligned (try %d).\n", try_);
+#ifdef CSR_AD9361_RX_DESKEW_IDELAY_ADDR
+            /* The FPGA->chip direction needs its own delay at the doubled
+             * rate (2R2T only; in 1R1T the interface rate stays in spec). */
+            {
+                uint32_t phy_control = 0;
+
+                (void)m2sdr_reg_read(dev, CSR_AD9361_PHY_CONTROL_ADDR, &phy_control);
+                if (!(phy_control & (1u << CSR_AD9361_PHY_CONTROL_MODE_OFFSET)))
+                    (void)m2sdr_tune_tx_delay(dev, phy);
+            }
+#endif
             return M2SDR_ERR_OK;
         }
     }

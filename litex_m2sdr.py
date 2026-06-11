@@ -755,13 +755,19 @@ class BaseSoC(SoCMini):
 
         with_rfic_stream_fifos = with_eth and not with_pcie
         self.ad9361 = AD9361RFIC(
-            rfic_pads      = platform.request("ad9361_rfic"),
-            spi_pads       = platform.request("ad9361_spi"),
-            sys_clk_freq   = sys_clk_freq,
-            with_tx_fifo   = with_rfic_stream_fifos,
-            tx_fifo_depth  = 8192,
-            with_rx_fifo   = with_rfic_stream_fifos,
-            rx_fifo_depth  = 8192,
+            rfic_pads         = platform.request("ad9361_rfic"),
+            spi_pads          = platform.request("ad9361_spi"),
+            sys_clk_freq      = sys_clk_freq,
+            with_tx_fifo      = with_rfic_stream_fifos,
+            tx_fifo_depth     = 8192,
+            with_rx_fifo      = with_rfic_stream_fifos,
+            rx_fifo_depth     = 8192,
+            # The internal PHY TX->RX loopback (diagnostics-only) does not close timing at
+            # 491.52MHz rfic_clk; Oversampling builds omit it (the CSR field then has no effect).
+            with_phy_loopback = not with_rfic_oversampling,
+            # Per-lane RX IDELAYE2 deskew: at 983Mbps per lane (2T2R @ 122.88MSPS) the board's
+            # lane-to-lane skew exceeds the eye, and the AD9361's delay registers are global-only.
+            with_rx_deskew    = with_rfic_oversampling,
         )
         self.ad9361.add_prbs()
         self.ad9361.add_agc()
@@ -803,7 +809,10 @@ class BaseSoC(SoCMini):
             self.comb += [
                 self.pcie_dma0.source.connect(self.crossbar.mux.sink0),
                 If(self.crossbar.mux.sel == 0,
-                    self.header.tx.reset.eq(~self.pcie_dma0.synchronizer.synced)
+                    # The synchronizer is shared between directions and stays synced while the
+                    # other direction runs; gating the FSM reset on the Reader enable re-aligns it
+                    # with the stream on every Reader start, including in Full-Duplex.
+                    self.header.tx.reset.eq(~self.pcie_dma0.synchronizer.synced | ~self.pcie_dma0.reader.enable)
                 )
             ]
         if with_eth:
@@ -826,7 +835,11 @@ class BaseSoC(SoCMini):
             self.comb += [
                 self.crossbar.demux.source0.connect(self.pcie_dma0.sink),
                 If(self.crossbar.demux.sel == 0,
-                    self.header.rx.reset.eq(~self.pcie_dma0.synchronizer.synced)
+                    # Same as the TX Header FSM above: gating on the Writer enable aligns the
+                    # inserted headers with the first DMA buffer on every Writer start (frames are
+                    # exactly one buffer long, so a phase slip at start would persist for the
+                    # whole run).
+                    self.header.rx.reset.eq(~self.pcie_dma0.synchronizer.synced | ~self.pcie_dma0.writer.enable)
                 )
             ]
         if with_eth:
@@ -1122,13 +1135,36 @@ class BaseSoC(SoCMini):
         # RFIC clock domain.
         platform.add_period_constraint(self.ad9361.cd_rfic.clk, 1e9/platform.rfic_clk_freq)
 
+        if with_rfic_oversampling and not with_eth:
+            # TX CDC FIFO output register (the only rfic_clk-clocked *_dat1_reg in non-Eth builds):
+            # its read-address cone is re-read unconditionally every cycle and the PHY consumes one
+            # word every 4 rfic_clk cycles (tx_count wrap), so a transient mis-capture after a
+            # launcher toggles is overwritten with the settled value long before use. Relax its
+            # setup check to 2 cycles (hold stays at 0) to close timing at 491.52MHz. Scoped -from
+            # rfic_clk so the sys-side RX CDC output register (read back-to-back) is NOT relaxed.
+            platform.toolchain.pre_placement_commands += [
+                "set_multicycle_path 2 -setup -from [get_clocks rfic_clk] "
+                "-to [get_cells -hierarchical -filter {{NAME =~ *storage_*_dat1_reg*}}]",
+                "set_multicycle_path 1 -hold  -from [get_clocks rfic_clk] "
+                "-to [get_cells -hierarchical -filter {{NAME =~ *storage_*_dat1_reg*}}]",
+            ]
+
         # Clk Measurements -------------------------------------------------------------------------
+
+        # At 491.52MHz rfic_clk a 64-bit free-running counter does not close timing; count a /4
+        # divided clock with increment=4 (same reported value, +/-4 cycles granularity).
+        if with_rfic_oversampling:
+            rfic_meas_div = Signal(2)
+            self.sync.rfic += rfic_meas_div.eq(rfic_meas_div + 1)
+            rfic_meas_clk = (rfic_meas_div[1], 4)
+        else:
+            rfic_meas_clk = ClockSignal("rfic")
 
         self.clk_measurement = MultiClkMeasurement(clks={
             "clk0" : ClockSignal("sys"),
             "clk1" : 0 if not with_pcie else ClockSignal("pcie"),
             "clk2" : si5351_clk0,
-            "clk3" : ClockSignal("rfic"),
+            "clk3" : rfic_meas_clk,
             "clk4" : si5351_clk1,
             "clk5" : ClockSignal("clk10"),
         })
@@ -1585,7 +1621,16 @@ def main():
         return r
 
     builder = Builder(soc, output_dir=os.path.join("build", get_build_name()), csr_csv="scripts/csr.csv")
-    builder.build(build_name=get_build_name(), run=args.build)
+    build_kwargs = {}
+    if args.with_rfic_oversampling:
+        # 491.52MHz rfic_clk needs more placer/router effort than the Vivado defaults.
+        build_kwargs.update(
+            vivado_place_directive               = "ExtraTimingOpt",
+            vivado_post_place_phys_opt_directive = "AggressiveExplore",
+            vivado_route_directive               = "AggressiveExplore",
+            vivado_post_route_phys_opt_directive = "AggressiveExplore",
+        )
+    builder.build(build_name=get_build_name(), run=args.build, **build_kwargs)
 
     # Generate LitePCIe Driver.
     generate_litepcie_software(soc, "litex_m2sdr/software", use_litepcie_software=args.driver)

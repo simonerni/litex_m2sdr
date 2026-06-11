@@ -40,6 +40,16 @@ class AD9361PRBSChecker(LiteXModule):
 
         # # #
 
+        # Input registration: the input data comes from the PHY RX mux; registering it (and ce)
+        # keeps the compare/re-seed cone off the PHY critical path at high DATA_CLK rates
+        # (491.52MHz with Oversampling).
+        i_r  = Signal(12)
+        ce_r = Signal()
+        self.sync += [
+            ce_r.eq(self.ce),
+            If(self.ce, i_r.eq(self.i)),
+        ]
+
         error = Signal()
 
         # # #
@@ -50,11 +60,19 @@ class AD9361PRBSChecker(LiteXModule):
         self.submodules += prbs
 
         # PRBS re-synchronization.
-        self.comb += prbs.ce.eq(self.ce)
+        self.comb += prbs.ce.eq(ce_r)
         self.comb += prbs.reset.eq(error)
 
-        # Error generation.
-        self.comb += If(self.ce, error.eq(self.i != prbs.o[:12]))
+        # Error generation (two registered stages: XOR then reduce, to close timing at high
+        # DATA_CLK rates; the reference re-seeds two cycles after a mismatch, the checker still
+        # self-locks by repeated re-seeding until the compare matches).
+        diff  = Signal(12)
+        ce_rr = Signal()
+        self.sync += [
+            diff.eq(i_r ^ prbs.o[:12]),
+            ce_rr.eq(ce_r),
+            error.eq(ce_rr & (diff != 0)),
+        ]
 
 
         # Sync generation.
