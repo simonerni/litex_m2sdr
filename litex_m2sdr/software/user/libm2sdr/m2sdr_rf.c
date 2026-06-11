@@ -1166,13 +1166,22 @@ static int m2sdr_wide_bandwidth_bringup(struct m2sdr_dev *dev,
 #ifdef CSR_AD9361_RX_DESKEW_IDELAY_ADDR
         /* 2R2T at the doubled rate runs 983Mbps per lane, where lane-to-lane
          * skew exceeds the eye; deskew per-lane before checking alignment
-         * (2R2T only: the metric needs identical words in both slots). */
+         * (2R2T only: the metric needs identical words in both slots). In
+         * 1R1T the taps must be zero: the lane rate stays in spec there and
+         * the bringup's chip-side delays assume undelayed lanes, but taps
+         * from an earlier 2R2T configuration persist in the IDELAYE2s. */
         {
             uint32_t phy_control = 0;
 
             (void)m2sdr_reg_read(dev, CSR_AD9361_PHY_CONTROL_ADDR, &phy_control);
-            if (!(phy_control & (1u << CSR_AD9361_PHY_CONTROL_MODE_OFFSET)))
+            if (!(phy_control & (1u << CSR_AD9361_PHY_CONTROL_MODE_OFFSET))) {
                 (void)m2sdr_deskew_rx_lanes(dev, phy);
+            } else {
+                unsigned lane;
+
+                for (lane = 0; lane < 6; lane++)
+                    (void)m2sdr_rx_deskew_set_lane(dev, lane, 0);
+            }
         }
 #endif
         rc = m2sdr_wide_bandwidth_verify(dev);
