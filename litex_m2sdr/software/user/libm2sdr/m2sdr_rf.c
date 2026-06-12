@@ -1113,7 +1113,7 @@ restore:
  * The TX lanes' 983Mbps eyes are mutually skewed by ~300ps with no per-lane
  * delay primitive available on the FPGA outputs; instead each TX ODDR is
  * clocked from an MMCM output whose static phase is re-programmed through
- * the DRP in VCO/8 (~127ps) steps. FB_CLK's output (CLKOUT6, constant
+ * the DRP in VCO/8 (~85ps) steps. FB_CLK's output (CLKOUT6, constant
  * pattern) provides the unrestricted global axis; the data lanes (CLKOUT0-5)
  * take small forward trims so the rfic-domain launch registers keep setup
  * margin. The error metric reuses the per-lane deskew counters: with the
@@ -1145,9 +1145,10 @@ static int m2sdr_mmcm_drp_rmw(struct m2sdr_dev *dev, unsigned adr, uint32_t mask
     return M2SDR_ERR_IO;
 }
 
-/* Set a CLKOUT's phase: phase_mux in VCO/8 (~127ps) steps plus delay_time in
- * whole VCO cycles (~1.017ns; 2 VCO cycles = one full 491.52MHz output cycle,
- * used to undo integer-cycle lane offsets from the calibrated crossing). */
+/* Set a CLKOUT's phase: phase_mux in VCO/8 (~85ps at the 1474.56MHz VCO)
+ * steps plus delay_time in whole VCO cycles (~678ps). The calibration trims
+ * with phase_mux only; delay_time is written so the clean-slate pass clears
+ * values persisting in the DRP from earlier configurations. */
 static int m2sdr_tx_phase_write_full(struct m2sdr_dev *dev, unsigned clkout,
                                      unsigned phase_mux, unsigned delay_time)
 {
@@ -1181,22 +1182,6 @@ static int m2sdr_tx_phase_write(struct m2sdr_dev *dev, unsigned clkout, unsigned
     return m2sdr_tx_phase_write_full(dev, clkout, phase_mux, 0);
 }
 
-/* CLKOUT divide (VCO cycles per output cycle) from ClkReg1 HIGH+LOW time. */
-static unsigned m2sdr_tx_phase_divide(struct m2sdr_dev *dev)
-{
-    uint32_t v;
-    int i;
-
-    m2sdr_reg_write(dev, CSR_AD9361_PHY_TX_MMCM_DRP_ADR_ADDR, m2sdr_mmcm_clkreg1[0]);
-    m2sdr_reg_write(dev, CSR_AD9361_PHY_TX_MMCM_DRP_READ_ADDR, 1);
-    for (i = 0; i < 100; i++) {
-        if (m2sdr_reg_read(dev, CSR_AD9361_PHY_TX_MMCM_DRP_DRDY_ADDR, &v) == 0 && v)
-            break;
-    }
-    m2sdr_reg_read(dev, CSR_AD9361_PHY_TX_MMCM_DRP_DAT_R_ADDR, &v);
-    return ((v >> 6) & 0x3F) + (v & 0x3F);
-}
-
 static int m2sdr_tx_phase_align(struct m2sdr_dev *dev, struct ad9361_rf_phy *phy)
 {
     uint32_t errs[6][8][8];
@@ -1205,7 +1190,6 @@ static int m2sdr_tx_phase_align(struct m2sdr_dev *dev, struct ad9361_rf_phy *phy
     unsigned fb, trim, lane, best_fb = 0, best_fb_score = 0;
     int rc = M2SDR_ERR_OK;
     uint32_t v;
-    int i;
 
     if (m2sdr_reg_read(dev, CSR_AD9361_PHY_TX_MMCM_DRP_LOCKED_ADDR, &v) != 0 || !v) {
         M2SDR_LOGF("TX phase align: MMCM not locked, skipping.\n");
@@ -1288,88 +1272,13 @@ static int m2sdr_tx_phase_align(struct m2sdr_dev *dev, struct ad9361_rf_phy *phy
         if (rc != M2SDR_ERR_OK)
             goto restore;
     }
+    /* The per-lane counters are the authoritative alignment metric here: the
+     * sequence-exact PRBS checker cannot verify this direction because the
+     * chip's data-port loopback observer runs at the chip's internal
+     * (pre-oversampling) clock view and decimates the word stream, so it
+     * never syncs at this rate even with bit-clean lanes. */
     if (best_fb_score < 6)
         rc = M2SDR_ERR_IO;
-
-    /* Verify with the real PRBS checker; the per-lane counters are blind to
-     * whole-cycle lane offsets (every slot of a shifted lane stays self-
-     * consistent), so when unsynced, search the per-lane integer-cycle
-     * corrections (one output cycle = 2 VCO cycles of DELAY_TIME). */
-    {
-        bool synced = false;
-        unsigned mask, best_mask = 0;
-        unsigned trims[6];
-
-        for (lane = 0; lane < 6; lane++) {
-            unsigned best_trim = 0;
-            uint32_t best_err = 0xFFFFFFFF;
-            for (trim = 0; trim < 8; trim++)
-                if (errs[lane][best_fb][trim] < best_err) {
-                    best_err = errs[lane][best_fb][trim];
-                    best_trim = trim;
-                }
-            trims[lane] = best_trim;
-        }
-        unsigned divide = m2sdr_tx_phase_divide(dev);
-        unsigned cdat;
-
-        M2SDR_LOGF("TX phase align: CLKOUT divide %u VCO cycles.\n", divide);
-        for (mask = 0; mask < 64 && !synced; mask++) {
-            for (lane = 0; lane < 6; lane++) {
-                rc = m2sdr_tx_phase_write_full(dev, lane, trims[lane],
-                    ((mask >> lane) & 1) ? divide : 0);
-                if (rc != M2SDR_ERR_OK)
-                    goto restore;
-            }
-            (void)m2sdr_write_prbs_tx_ctrl(dev, 0);
-            mdelay(2);
-            (void)m2sdr_write_prbs_tx_ctrl(dev, 1u << CSR_AD9361_PRBS_TX_ENABLE_OFFSET);
-            for (i = 0; i < 8 && !synced; i++) {
-                mdelay(5);
-                (void)m2sdr_read_prbs_synced(dev, &synced);
-            }
-            if (synced)
-                best_mask = mask;
-        }
-        /* Checker-driven fallback: scan FB phase x uniform trim x chip TX tap
-         * directly against the PRBS checker. */
-        for (cdat = 0; cdat < 4 && !synced; cdat++) {
-            (void)m2sdr_program_delay_reg(phy, true, 0, cdat, false);
-            for (fb = 0; fb < 8 && !synced; fb++) {
-                rc = m2sdr_tx_phase_write(dev, 6, fb);
-                if (rc != M2SDR_ERR_OK)
-                    goto restore;
-                for (trim = 0; trim < 8 && !synced; trim++) {
-                    for (lane = 0; lane < 6; lane++) {
-                        rc = m2sdr_tx_phase_write(dev, lane, trim);
-                        if (rc != M2SDR_ERR_OK)
-                            goto restore;
-                    }
-                    (void)m2sdr_write_prbs_tx_ctrl(dev, 0);
-                    mdelay(2);
-                    (void)m2sdr_write_prbs_tx_ctrl(dev, 1u << CSR_AD9361_PRBS_TX_ENABLE_OFFSET);
-                    for (i = 0; i < 6 && !synced; i++) {
-                        mdelay(5);
-                        (void)m2sdr_read_prbs_synced(dev, &synced);
-                    }
-                    if (synced)
-                        M2SDR_LOGF("TX phase align: checker scan hit at chip dat %u fb %u trim %u.\n",
-                            cdat, fb, trim);
-                }
-            }
-        }
-        /* The chip's data-port loopback observer runs at the chip's internal
-         * (pre-oversampling) clock view and decimates the word stream, so
-         * the sequence-exact checker cannot sync through it at this rate
-         * even with bit-clean lanes; the per-lane counters are the
-         * authoritative alignment metric here. */
-        M2SDR_LOGF("TX phase align: PRBS %s (cycle mask 0x%02x).\n",
-            synced ? "SYNCED" : "not synced (loopback observer is decimated at this rate)", best_mask);
-        if (!synced && best_fb_score == 6)
-            rc = M2SDR_ERR_OK;
-        else if (!synced)
-            rc = M2SDR_ERR_IO;
-    }
 
 restore:
     (void)m2sdr_write_prbs_tx_ctrl(dev, saved_prbs_tx);

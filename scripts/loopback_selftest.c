@@ -119,7 +119,6 @@ static atomic_int    tx_mode    = TX_TONE;
 static atomic_int    tx_paused  = 0;     /* ack that the thread is idle   */
 static atomic_long   tx_bufs    = 0;
 static atomic_long   tx_underflows = 0;
-static atomic_ulong  tx_last_ts = 0;
 static pthread_t     tx_thread;
 static int           tx_running = 0;
 
@@ -203,7 +202,6 @@ static void *tx_main(void *arg)
             usleep(1000);
             continue;
         }
-        atomic_store(&tx_last_ts, meta.timestamp);
         atomic_fetch_add(&tx_bufs, 1);
     }
     m2sdr_free_buffer(buf);
@@ -599,7 +597,6 @@ static void phase_burst(void *payload)
         return;
     }
     int c = chan_cabled[1] ? 1 : 0; /* measure on one cabled channel */
-    double thr_hi = 0.5 * steady_amp[c];
     double thr_lo = 0.1 * steady_amp[c];
     if (steady_amp[c] < 0.01) {
         skip("burst.spacing", "no steady tone amplitude to gate against");
@@ -651,7 +648,6 @@ static void phase_burst(void *payload)
                 arrivals[n_arr++] = (double)st.ts + edge / opt.rate * 1e9;
         }
         low_run = 0;
-        (void)thr_hi;
     }
 
     atomic_store(&tx_mode, TX_TONE);

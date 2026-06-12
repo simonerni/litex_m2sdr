@@ -7566,6 +7566,37 @@ static bool ad9361_wide_bbf_tune(struct ad9361_rf_phy *phy, uint32_t bbbw)
     return ok;
 }
 
+/* Load an equalizer FIR (file of integer taps, one per line, multiple of 16)
+ * into the chip FIR engine. The engine corrupts data beyond a 245.76 MHz
+ * processing clock at this overclock (measured), which caps the taps per
+ * direction; the caller passes the cap and configures dec/int = 1. Returns
+ * the FIR-enable low bits for 0x002/0x003 (0x01 loaded, 0x00 off). */
+static uint8_t ad9361_load_eq_fir(struct ad9361_rf_phy *phy, const char *file,
+                                  enum fir_dest dest, int max_taps, const char *what)
+{
+    int16_t coefs[64];
+    FILE *ff = fopen(file, "r");
+    int n = 0;
+
+    if (ff) {
+        int v;
+        while (n < 64 && fscanf(ff, "%d", &v) == 1)
+            coefs[n++] = (int16_t)v;
+        fclose(ff);
+    }
+    if (n <= 0 || (n % 16) != 0 || n > max_taps) {
+        printf("RFIC overclock: bad %s EQ FIR file '%s' (%d taps), FIR off.\n",
+               what, file, n);
+        return 0x00;
+    }
+    if (ad9361_load_fir_filter_coef(phy, dest, 0, n, coefs) != 0) {
+        printf("RFIC overclock: %s EQ FIR load FAILED, FIR off.\n", what);
+        return 0x00;
+    }
+    printf("RFIC overclock: %d-tap %s EQ FIR loaded (%s).\n", n, what, file);
+    return 0x01;
+}
+
 void ad9361_enable_oversampling(struct ad9361_rf_phy *phy)
 {
     /* Filter-control registers: halve the decimation/interpolation so the data
@@ -7577,34 +7608,6 @@ void ad9361_enable_oversampling(struct ad9361_rf_phy *phy)
      * both the AD9361 LVDS spec and the stock 245.76 MHz gateware). So preserve
      * the channel enables via read-modify-write rather than writing fixed
      * 2-channel values. */
-    /* M2SDR_OC_ADC_OC (experiment, MEASURED WORSE - kept for reference):
-     * raise the ADC oversampling ratio against the in-band shaped (NTF)
-     * noise at the outer +/-36-49MHz: BBPLL 983.04 -> 1474.56MHz (+3% over
-     * spec, locks), ADC = BBPLL/2 = 737.28MHz (+15% over spec), decimation
-     * /4 -> /6 via RHB3 in DEC3 mode; output rate and DATA_CLK unchanged,
-     * Tx INT3 required (UG-570), DAC at 368.64MHz. Measured: the edge floor
-     * is ~4dB WORSE - past its 640MHz spec the converter loop noise grows
-     * faster than the oversampling ratio gains. */
-    bool adc_oc = false;
-    {
-        const char *s = getenv("M2SDR_OC_ADC_OC");
-        if (s != NULL && strtoul(s, NULL, 0)) {
-            uint32_t parent = clk_get_rate(phy, phy->ref_clk_scale[BB_REFCLK]);
-
-            if (ad9361_bbpll_set_rate(phy->ref_clk_scale[BBPLL_CLK],
-                                      1474560000U, parent) == 0) {
-                adc_oc = true;
-                /* DAC = ADC/2 (368.64MHz with Tx INT3). */
-                ad9361_spi_writef(phy->spi, REG_BBPLL, BIT(3), 1);
-                printf("RFIC overclock: ADC overclock on (BBPLL 1474.56MHz locked, ADC 737.28, dec6).\n");
-            } else {
-                (void)ad9361_bbpll_set_rate(phy->ref_clk_scale[BBPLL_CLK],
-                                            983040000U, parent);
-                printf("RFIC overclock: BBPLL 1474.56MHz FAILED to lock, staying at 983.04.\n");
-            }
-        }
-    }
-
     {
         /* Bits [7:6] of 0x002/0x003 are the TX/RX channel enables and select
          * the LVDS framing (UG-570 Table 50); they are preserved here - the
@@ -7615,41 +7618,18 @@ void ad9361_enable_oversampling(struct ad9361_rf_phy *phy)
          * RHB2 bypassed ([3]=0), RHB1 dec2 ([2]=1), RX FIR off ([1:0]=00):
          * total decimation 4 from a 4x-rate ADC clock = 2x port rate. */
         uint8_t rx_fir = 0x00;
-        /* M2SDR_OC_RX_FIR_FILE: load a decimate-by-1 RX FIR (file of integer
-         * taps, one per line) as a passband flatness equalizer; the composite
-         * BBF + half-band response otherwise rolls off ~7-9.5dB over the
-         * outer +/-36-49MHz. At most 32 taps: the FIR engine corrupts data
-         * beyond a 245.76MHz processing clock at this overclock (measured),
-         * which 32 taps at the 122.88MHz output rate just meets. */
+        /* M2SDR_OC_RX_FIR_FILE: decimate-by-1 RX FIR as a passband flatness
+         * equalizer; the composite BBF + half-band response otherwise rolls
+         * off ~7-9.5dB over the outer +/-36-49MHz. Up to 32 taps: the engine
+         * processes at 2x the 122.88MHz output rate here, which 32 taps just
+         * meet. */
         const char *fir_file = getenv("M2SDR_OC_RX_FIR_FILE");
         if (fir_file != NULL) {
-            int16_t coefs[64];
-            FILE *ff = fopen(fir_file, "r");
-            int n = 0;
-            if (ff) {
-                int v;
-                while (n < 64 && fscanf(ff, "%d", &v) == 1)
-                    coefs[n++] = (int16_t)v;
-                fclose(ff);
-            }
-            if (n > 0 && (n % 16) == 0 && n <= 32) {
-                phy->rx_fir_dec = 1;
-                if (ad9361_load_fir_filter_coef(phy,
-                        (enum fir_dest)(((rx_ctrl >> 6) & 0x3) | FIR_IS_RX),
-                        0, n, coefs) == 0) {
-                    rx_fir = 0x01;  /* FIR enabled, decimate by 1. */
-                    printf("RFIC overclock: %d-tap dec1 RX EQ FIR loaded (%s).\n",
-                           n, fir_file);
-                } else {
-                    printf("RFIC overclock: RX EQ FIR load FAILED, FIR off.\n");
-                }
-            } else {
-                printf("RFIC overclock: bad RX EQ FIR file '%s' (%d taps), FIR off.\n",
-                       fir_file, n);
-            }
+            phy->rx_fir_dec = 1;
+            rx_fir = ad9361_load_eq_fir(phy, fir_file,
+                (enum fir_dest)(((rx_ctrl >> 6) & 0x3) | FIR_IS_RX), 32, "RX");
         }
-        ad9361_spi_write(phy->spi, 0x003,
-            (rx_ctrl & 0xC0) | (adc_oc ? 0x24 : 0x14) | rx_fir);
+        ad9361_spi_write(phy->spi, 0x003, (rx_ctrl & 0xC0) | 0x14 | rx_fir);
         /* M2SDR_OC_TX_FIR_FILE: interpolate-by-1 TX FIR as a passband
          * pre-emphasis equalizer (the composite TX BBF + DAC sinc response
          * droops to ~-8dB over the outer +/-38-49MHz; measured flat to
@@ -7658,41 +7638,19 @@ void ad9361_enable_oversampling(struct ad9361_rf_phy *phy)
          * seen twice with the interpolation stages bypassed), so the taps
          * must be designed for fs = 245.76MHz, not the 122.88MHz port rate
          * - a 122.88-designed filter applies frequency-stretched 2x and
-         * degenerates to its DC gain over the signal band. Same 16-tap
-         * engine limit as the RX FIR. Pre-emphasis costs its peak boost in
-         * maximum output power. */
+         * degenerates to its DC gain over the signal band - and the engine
+         * ceiling allows only 16 of them. Pre-emphasis costs its peak boost
+         * in maximum output power. */
         uint8_t tx_fir = 0x00;
         const char *tx_fir_file = getenv("M2SDR_OC_TX_FIR_FILE");
         if (tx_fir_file != NULL) {
-            int16_t coefs[64];
-            FILE *ff = fopen(tx_fir_file, "r");
-            int n = 0;
-            if (ff) {
-                int v;
-                while (n < 64 && fscanf(ff, "%d", &v) == 1)
-                    coefs[n++] = (int16_t)v;
-                fclose(ff);
-            }
-            if (n > 0 && (n % 16) == 0 && n <= 32) {
-                phy->tx_fir_int = 1;
-                if (ad9361_load_fir_filter_coef(phy,
-                        (enum fir_dest)((tx_ctrl >> 6) & 0x3),
-                        0, n, coefs) == 0) {
-                    tx_fir = 0x01;  /* FIR enabled, interpolate by 1. */
-                    printf("RFIC overclock: %d-tap int1 TX EQ FIR loaded (%s).\n",
-                           n, tx_fir_file);
-                } else {
-                    printf("RFIC overclock: TX EQ FIR load FAILED, FIR off.\n");
-                }
-            } else {
-                printf("RFIC overclock: bad TX EQ FIR file '%s' (%d taps), FIR off.\n",
-                       tx_fir_file, n);
-            }
+            phy->tx_fir_int = 1;
+            tx_fir = ad9361_load_eq_fir(phy, tx_fir_file,
+                (enum fir_dest)((tx_ctrl >> 6) & 0x3), 16, "TX");
         }
         /* 0x002 (Tx Enable & Filter Ctrl) low bits 0x00: all THB stages and
-         * the TX FIR bypassed - the DAC runs directly at the port rate (with
-         * the ADC overclock: THB3 in INT3 mode, DAC at 3x the port rate). */
-        ad9361_spi_write(phy->spi, 0x002, (tx_ctrl & 0xC0) | (adc_oc ? 0x20 : 0x00) | tx_fir);
+         * the TX FIR bypassed - the DAC runs directly at the port rate. */
+        ad9361_spi_write(phy->spi, 0x002, (tx_ctrl & 0xC0) | 0x00 | tx_fir);
     }
 
     /* Baseband filters: the default is the chip-native wide tune (the chip's
@@ -7770,26 +7728,6 @@ void ad9361_enable_oversampling(struct ad9361_rf_phy *phy)
                                                   * disabled recipe's artifact. */
         ad9361_spi_write(phy->spi, 0x1ef, 0x00); /* RX BBF CC2 ctr -> 0.  */
         ad9361_spi_write(phy->spi, 0x1e0, 0xbf); /* RX BBF R1A (re-asserted per doc). */
-    }
-
-    /* The ADC's internal configuration (bias currents, integrator scaling)
-     * is computed from the BBPLL/ADC rates and the calibrated BBF corner;
-     * recompute it for the overclocked rates (must follow the BBF tune,
-     * which sets the C3/R2346 words and rxbbf_div it reads). */
-    if (adc_oc && getenv("M2SDR_OC_NO_ADC_SETUP") == NULL) {
-        ad9361_rx_adc_setup(phy, 1474560000U, 737280000U);
-    } else if (!adc_oc && getenv("M2SDR_OC_ADC_RESETUP") != NULL) {
-        /* Recompute the ADC loop scaling with an assumed BBF divider from
-         * the env (experiment, REJECTED: narrow-assumption configs can look
-         * a few dB better on a no-signal floor but saturate internally
-         * under wideband drive - NPR collapses; the init-time setup is the
-         * right one under signal). */
-        uint32_t bbpll = clk_get_rate(phy, phy->ref_clk_scale[BBPLL_CLK]);
-        uint32_t div = (uint32_t)strtoul(getenv("M2SDR_OC_ADC_RESETUP"), NULL, 0);
-
-        if (div >= 1 && div <= 64)
-            phy->rxbbf_div = div;
-        ad9361_rx_adc_setup(phy, bbpll, bbpll / 2);
     }
 
     /* 0x3F6 (BIST and Data Port Test Config): register map requires the low

@@ -14,45 +14,6 @@ from litex.soc.interconnect.csr import *
 from litex.soc.interconnect     import stream
 
 from litex.soc.cores.clock import S7MMCM
-from litex.soc.cores.clock.xilinx_common import XilinxClocking
-
-
-class S7MMCMFbBufg(S7MMCM):
-    """S7MMCM with its feedback path through a BUFG: the output clocks are then
-    deskewed against a BUFG-buffered copy of the input, i.e. phase-aligned with
-    logic clocked by an ordinary BUFG from the same source (instead of with the
-    input pad), which is what the rfic-domain launch registers ride."""
-    def do_finalize(self):
-        XilinxClocking.do_finalize(self)
-        config = self.compute_config()
-        mmcm_fb_out = Signal()
-        mmcm_fb_in  = Signal()
-        self.params.update(
-            # Global.
-            p_BANDWIDTH = "OPTIMIZED",
-            i_RST       = self.reset,
-            i_PWRDWN    = self.power_down,
-            o_LOCKED    = self.locked,
-
-            # VCO.
-            p_REF_JITTER1     = 0.01,
-            p_CLKIN1_PERIOD   = 1e9/self.clkin_freq,
-            p_CLKFBOUT_MULT_F = config["clkfbout_mult"],
-            p_DIVCLK_DIVIDE   = config["divclk_divide"],
-            i_CLKIN1          = self.clkin,
-            i_CLKFBIN         = mmcm_fb_in,
-            o_CLKFBOUT        = mmcm_fb_out,
-        )
-        self.specials += Instance("BUFG", i_I=mmcm_fb_out, o_O=mmcm_fb_in)
-        for n, clkout in sorted(self.clkouts.items()):
-            if n == 0:
-                self.params["p_CLKOUT{}_DIVIDE_F".format(n)] = config["clkout{}_divide".format(n)]
-            else:
-                self.params["p_CLKOUT{}_DIVIDE".format(n)] = config["clkout{}_divide".format(n)]
-            self.params["p_CLKOUT{}_PHASE".format(n)] = config["clkout{}_phase".format(n)]
-            self.params["o_CLKOUT{}".format(n)]       = clkout.clk
-        self.specials += Instance("MMCME2_ADV", name=self.name or "", **self.params)
-
 
 """
 AD9361 RFIC PHY (Dual Port Full Duplex LVDS Mode).
@@ -414,7 +375,6 @@ class AD9361PHY(LiteXModule):
             tx_lane_clk = [cd.clk for cd in tx_ph_cds[:6]]
             tx_fb_clk   = tx_ph_cds[6].clk
         else:
-            tx_ph_cds   = None
             tx_lane_clk = [ClockSignal("rfic") for _ in range(6)]
             tx_fb_clk   = ClockSignal("rfic")
 
