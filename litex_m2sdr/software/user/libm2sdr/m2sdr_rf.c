@@ -1212,23 +1212,32 @@ static int m2sdr_wide_bandwidth_bringup(struct m2sdr_dev *dev,
                 ad9361_spi_write(phy->spi, REG_CALIBRATION_CONFIG_3,
                     PREVENT_POS_LOOP_GAIN | K_EXP_AMPLITUDE(kexp));
             }
-            /* RX RFPLL loop peaking: the LUT charge-pump current leaves a
-             * ~5dB skirt bump at 1-3MHz offsets (measured); half the current
-             * removes it (integrated 10k-10M phase noise -21.5 -> -24dBc).
+            /* RFPLL loop peaking: the LUT charge-pump current leaves a
+             * ~5dB skirt bump at 1-3MHz offsets (measured); reducing it to
+             * ~30% removes the peaking on both synthesizers and the EVM
+             * plateaus there (RX 6.8 -> 6.2%, TX 7.3 -> 5.1% on a 50MHz TM;
+             * lower values measure no further gain and erode loop margin).
              * M2SDR_RFPLL_CP_PERCENT overrides (100 = LUT value). */
             {
                 const char *s = getenv("M2SDR_RFPLL_CP_PERCENT");
-                unsigned pct = s ? (unsigned)strtoul(s, NULL, 0) : 50;
-                uint8_t cp = ad9361_spi_read(phy->spi, REG_RX_CP_CURRENT);
-                uint8_t icp = cp & CHARGE_PUMP_CURRENT(~0);
-                uint8_t nicp = (uint8_t)((icp * pct + 50) / 100);
+                unsigned pct = s ? (unsigned)strtoul(s, NULL, 0) : 30;
+                static const uint16_t cp_regs[2] = {
+                    REG_RX_CP_CURRENT, REG_TX_CP_CURRENT
+                };
+                unsigned i;
 
-                if (nicp < 1)
-                    nicp = 1;
-                if (nicp > CHARGE_PUMP_CURRENT(~0))
-                    nicp = CHARGE_PUMP_CURRENT(~0);
-                ad9361_spi_write(phy->spi, REG_RX_CP_CURRENT,
-                    (cp & ~CHARGE_PUMP_CURRENT(~0)) | nicp);
+                for (i = 0; i < 2; i++) {
+                    uint8_t cp = ad9361_spi_read(phy->spi, cp_regs[i]);
+                    uint8_t icp = cp & CHARGE_PUMP_CURRENT(~0);
+                    uint8_t nicp = (uint8_t)((icp * pct + 50) / 100);
+
+                    if (nicp < 1)
+                        nicp = 1;
+                    if (nicp > CHARGE_PUMP_CURRENT(~0))
+                        nicp = CHARGE_PUMP_CURRENT(~0);
+                    ad9361_spi_write(phy->spi, cp_regs[i],
+                        (cp & ~CHARGE_PUMP_CURRENT(~0)) | nicp);
+                }
             }
             return M2SDR_ERR_OK;
         }

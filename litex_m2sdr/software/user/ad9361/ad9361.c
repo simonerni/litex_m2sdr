@@ -7650,10 +7650,45 @@ void ad9361_enable_oversampling(struct ad9361_rf_phy *phy)
         }
         ad9361_spi_write(phy->spi, 0x003,
             (rx_ctrl & 0xC0) | (adc_oc ? 0x24 : 0x14) | rx_fir);
+        /* M2SDR_OC_TX_FIR_FILE (experiment, NONFUNCTIONAL in wide mode -
+         * kept for reference): in this mode the chip's TX_SAMPL clock view
+         * differs from the real port rate and the TX FIR degenerates to a
+         * flat scalar equal to its DC gain (measured: shape unchanged,
+         * level dropped by sum-of-taps). Use waveform pre-emphasis for TX
+         * flatness instead (the composite TX BBF + DAC sinc response droops
+         * to ~-8dB over the outer +/-38-49MHz). */
+        uint8_t tx_fir = 0x00;
+        const char *tx_fir_file = getenv("M2SDR_OC_TX_FIR_FILE");
+        if (tx_fir_file != NULL) {
+            int16_t coefs[64];
+            FILE *ff = fopen(tx_fir_file, "r");
+            int n = 0;
+            if (ff) {
+                int v;
+                while (n < 64 && fscanf(ff, "%d", &v) == 1)
+                    coefs[n++] = (int16_t)v;
+                fclose(ff);
+            }
+            if (n > 0 && (n % 16) == 0 && n <= 32) {
+                phy->tx_fir_int = 1;
+                if (ad9361_load_fir_filter_coef(phy,
+                        (enum fir_dest)((tx_ctrl >> 6) & 0x3),
+                        0, n, coefs) == 0) {
+                    tx_fir = 0x01;  /* FIR enabled, interpolate by 1. */
+                    printf("RFIC overclock: %d-tap int1 TX EQ FIR loaded (%s).\n",
+                           n, tx_fir_file);
+                } else {
+                    printf("RFIC overclock: TX EQ FIR load FAILED, FIR off.\n");
+                }
+            } else {
+                printf("RFIC overclock: bad TX EQ FIR file '%s' (%d taps), FIR off.\n",
+                       tx_fir_file, n);
+            }
+        }
         /* 0x002 (Tx Enable & Filter Ctrl) low bits 0x00: all THB stages and
          * the TX FIR bypassed - the DAC runs directly at the port rate (with
          * the ADC overclock: THB3 in INT3 mode, DAC at 3x the port rate). */
-        ad9361_spi_write(phy->spi, 0x002, (tx_ctrl & 0xC0) | (adc_oc ? 0x20 : 0x00));
+        ad9361_spi_write(phy->spi, 0x002, (tx_ctrl & 0xC0) | (adc_oc ? 0x20 : 0x00) | tx_fir);
     }
 
     /* Baseband filters: the default is the chip-native wide tune (the chip's
