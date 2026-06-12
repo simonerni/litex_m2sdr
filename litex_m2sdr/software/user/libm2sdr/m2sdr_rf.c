@@ -1452,7 +1452,14 @@ int m2sdr_apply_config(struct m2sdr_dev *dev, const struct m2sdr_config *cfg)
     init_param->gpio_cal_sw1       = -1;
     init_param->gpio_cal_sw2       = -1;
 
-    rc = m2sdr_apply_channel_layout(dev, init_param, channel_layout, 0, 0);
+    {
+        /* M2SDR_RF_CHANNEL=2 selects the second physical RF port pair
+         * (RX2/TX2) in 1T1R; the default is RX1/TX1. */
+        const char *s = getenv("M2SDR_RF_CHANNEL");
+        unsigned ch = (s != NULL && strtoul(s, NULL, 0) == 2) ? 1 : 0;
+
+        rc = m2sdr_apply_channel_layout(dev, init_param, channel_layout, ch, ch);
+    }
     if (rc != M2SDR_ERR_OK)
         return rc;
 #ifdef USE_LITEETH
@@ -1527,6 +1534,27 @@ int m2sdr_apply_config(struct m2sdr_dev *dev, const struct m2sdr_config *cfg)
         if (rc != M2SDR_ERR_OK)
             return rc;
     }
+#ifdef CSR_AD9361_RX_DESKEW_IDELAY_ADDR
+    else {
+        /* In-spec rates on the deskew-capable gateware: the per-lane RX
+         * IDELAYE2s add ~0.6ns of insertion delay that the chip's init-table
+         * interface delays predate, leaving the interface misaligned
+         * (full-scale noise captures). Apply the PRBS-calibrated midpoints
+         * (clk 4 / data 3 RX, clk 6 / data 7 TX, measured at DATA_CLK
+         * 245.76MHz) and zero any per-lane taps left by an earlier
+         * wide-mode configuration. */
+        unsigned lane;
+
+        rc = m2sdr_program_delay_reg(phy, false, 4, 3, true);
+        if (rc != M2SDR_ERR_OK)
+            return rc;
+        rc = m2sdr_program_delay_reg(phy, true, 6, 7, true);
+        if (rc != M2SDR_ERR_OK)
+            return rc;
+        for (lane = 0; lane < 6; lane++)
+            (void)m2sdr_rx_deskew_set_lane(dev, lane, 0);
+    }
+#endif
 
     return M2SDR_ERR_OK;
 }
