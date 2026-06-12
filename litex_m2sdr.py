@@ -1174,6 +1174,29 @@ class BaseSoC(SoCMini):
                 "set_clock_groups -logically_exclusive "
                 "-group [get_clocks ad9361_rfic_rx_clk_p] "
                 "-group [get_clocks -filter {{NAME =~ *ad9361phy_clkout*}}]",
+                # The 2R2T PRBS checkers' compare/re-seed recurrence captures on a ce that the
+                # PHY asserts at most once per 4 rfic_clk cycles (one word per 4 DDR phases),
+                # and the capture is retimed so both compare operands are stable two cycles
+                # before every capture by construction: the recurrence paths into the state
+                # registers are exact 2-cycle paths.
+                # error_r captures the ce_rr-gated compare: on every cycle other than the
+                # (2-cycle-stable) sample cycle the gating flop forces the cone low, so the
+                # compare-dependent capture is also an exact 2-cycle path.
+                "set_multicycle_path 2 -setup "
+                "-to [get_cells -hierarchical -filter {{NAME =~ *ad9361prbschecker*state_reg* || "
+                "NAME =~ *ad9361prbschecker*error_r_reg*}}]",
+                "set_multicycle_path 1 -hold "
+                "-to [get_cells -hierarchical -filter {{NAME =~ *ad9361prbschecker*state_reg* || "
+                "NAME =~ *ad9361prbschecker*error_r_reg*}}]",
+                # Same retimed-capture property for the 1R1T checker's reference pair (which
+                # additionally never carries meaningful data at 491.52MHz: 1R1T caps DATA_CLK
+                # at 245.76MHz, and at 491.52MHz the design is necessarily in 2R2T mode).
+                "set_multicycle_path 2 -setup "
+                "-to [get_cells -hierarchical -filter {{NAME =~ *prbs_checker_1r1t_state* || "
+                "NAME =~ *prbs_checker_1r1t_error_r*}}]",
+                "set_multicycle_path 1 -hold "
+                "-to [get_cells -hierarchical -filter {{NAME =~ *prbs_checker_1r1t_state* || "
+                "NAME =~ *prbs_checker_1r1t_error_r*}}]",
                 # The rfic -> phased-lane-domain crossing's validity is enforced by the TX phase
                 # calibration, not by static analysis: the lane trim moves the capture clock in
                 # VCO/8 steps and a miscapture shows in the per-lane PRBS error counters the
@@ -1656,7 +1679,10 @@ def main():
 
     builder = Builder(soc, output_dir=os.path.join("build", get_build_name()), csr_csv="scripts/csr.csv")
     build_kwargs = {}
-    if args.with_rfic_oversampling:
+    # Only pass the Vivado directives for actual builds: they are toolchain
+    # kwargs newer than some LiteX releases, and elaboration-only runs
+    # (run=False, e.g. CI) never reach Vivado.
+    if args.with_rfic_oversampling and args.build:
         # 491.52MHz rfic_clk needs more placer/router effort than the Vivado defaults.
         build_kwargs.update(
             vivado_place_directive               = "ExtraTimingOpt",
