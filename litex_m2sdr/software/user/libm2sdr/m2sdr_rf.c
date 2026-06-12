@@ -1453,6 +1453,11 @@ static int m2sdr_wide_bandwidth_bringup(struct m2sdr_dev *dev,
 
                 for (lane = 0; lane < 6; lane++)
                     (void)m2sdr_rx_deskew_set_lane(dev, lane, 0);
+#ifdef CSR_AD9361_PHY_TX_PHASE_ADDR
+                /* 1R1T wide mode runs DATA_CLK at 245.76MHz: the TX phase
+                 * MMCM is unlocked there, keep the bypass selected. */
+                m2sdr_reg_write(dev, CSR_AD9361_PHY_TX_PHASE_ADDR, 0);
+#endif
             }
         }
 #endif
@@ -1829,6 +1834,11 @@ int m2sdr_apply_config(struct m2sdr_dev *dev, const struct m2sdr_config *cfg)
             return rc;
         for (lane = 0; lane < 6; lane++)
             (void)m2sdr_rx_deskew_set_lane(dev, lane, 0);
+#ifdef CSR_AD9361_PHY_TX_PHASE_ADDR
+        /* The TX clock-phase mux persists across configurations; off the
+         * 491.52MHz DATA_CLK the MMCM is unlocked and its leg is dead. */
+        m2sdr_reg_write(dev, CSR_AD9361_PHY_TX_PHASE_ADDR, 0);
+#endif
     }
 #endif
 
