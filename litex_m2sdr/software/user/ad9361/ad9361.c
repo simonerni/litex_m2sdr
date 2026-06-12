@@ -7585,7 +7585,41 @@ void ad9361_enable_oversampling(struct ad9361_rf_phy *phy)
         /* 0x003 (Rx Enable & Filter Ctrl) low bits 0x14: RHB3 dec2 ([5:4]=01),
          * RHB2 bypassed ([3]=0), RHB1 dec2 ([2]=1), RX FIR off ([1:0]=00):
          * total decimation 4 from a 4x-rate ADC clock = 2x port rate. */
-        ad9361_spi_write(phy->spi, 0x003, (rx_ctrl & 0xC0) | 0x14);
+        uint8_t rx_fir = 0x00;
+        /* M2SDR_OC_RX_FIR_FILE: load a decimate-by-1 RX FIR (file of integer
+         * taps, one per line) as a passband flatness equalizer; the composite
+         * BBF + half-band response otherwise rolls off ~7-9.5dB over the
+         * outer +/-36-49MHz. At most 32 taps: the FIR engine corrupts data
+         * beyond a 245.76MHz processing clock at this overclock (measured),
+         * which 32 taps at the 122.88MHz output rate just meets. */
+        const char *fir_file = getenv("M2SDR_OC_RX_FIR_FILE");
+        if (fir_file != NULL) {
+            int16_t coefs[64];
+            FILE *ff = fopen(fir_file, "r");
+            int n = 0;
+            if (ff) {
+                int v;
+                while (n < 64 && fscanf(ff, "%d", &v) == 1)
+                    coefs[n++] = (int16_t)v;
+                fclose(ff);
+            }
+            if (n > 0 && (n % 16) == 0 && n <= 32) {
+                phy->rx_fir_dec = 1;
+                if (ad9361_load_fir_filter_coef(phy,
+                        (enum fir_dest)(((rx_ctrl >> 6) & 0x3) | FIR_IS_RX),
+                        0, n, coefs) == 0) {
+                    rx_fir = 0x01;  /* FIR enabled, decimate by 1. */
+                    printf("RFIC overclock: %d-tap dec1 RX EQ FIR loaded (%s).\n",
+                           n, fir_file);
+                } else {
+                    printf("RFIC overclock: RX EQ FIR load FAILED, FIR off.\n");
+                }
+            } else {
+                printf("RFIC overclock: bad RX EQ FIR file '%s' (%d taps), FIR off.\n",
+                       fir_file, n);
+            }
+        }
+        ad9361_spi_write(phy->spi, 0x003, (rx_ctrl & 0xC0) | 0x14 | rx_fir);
         /* 0x002 (Tx Enable & Filter Ctrl) low bits 0x00: all THB stages and
          * the TX FIR bypassed - the DAC runs directly at the port rate. */
         ad9361_spi_write(phy->spi, 0x002, (tx_ctrl & 0xC0) | 0x00);
