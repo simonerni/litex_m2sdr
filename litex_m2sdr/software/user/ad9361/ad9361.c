@@ -7522,6 +7522,7 @@ static bool ad9361_wide_bbf_tune(struct ad9361_rf_phy *phy, uint32_t bbbw)
     ad9361_spi_write(phy->spi, REG_RX_BBF_TUNE_DIVIDE, divider & 0xff);
     ad9361_spi_write(phy->spi, REG_RX_BBF_TUNE_CONFIG,
         (ad9361_spi_read(phy->spi, REG_RX_BBF_TUNE_CONFIG) & ~1) | (divider >> 8));
+    phy->rxbbf_div = divider; /* keep the driver's view (ADC setup uses it). */
     ad9361_spi_write(phy->spi, REG_RX_BBBW_MHZ, bbbw / 1000000u);
     ad9361_spi_write(phy->spi, REG_RX_BBBW_KHZ, khz > 127 ? 127 : khz);
     ad9361_spi_write(phy->spi, REG_RX_MIX_LO_CM, RX_MIX_LO_CM(0x3F));
@@ -7576,6 +7577,34 @@ void ad9361_enable_oversampling(struct ad9361_rf_phy *phy)
      * both the AD9361 LVDS spec and the stock 245.76 MHz gateware). So preserve
      * the channel enables via read-modify-write rather than writing fixed
      * 2-channel values. */
+    /* M2SDR_OC_ADC_OC (experiment, MEASURED WORSE - kept for reference):
+     * raise the ADC oversampling ratio against the in-band shaped (NTF)
+     * noise at the outer +/-36-49MHz: BBPLL 983.04 -> 1474.56MHz (+3% over
+     * spec, locks), ADC = BBPLL/2 = 737.28MHz (+15% over spec), decimation
+     * /4 -> /6 via RHB3 in DEC3 mode; output rate and DATA_CLK unchanged,
+     * Tx INT3 required (UG-570), DAC at 368.64MHz. Measured: the edge floor
+     * is ~4dB WORSE - past its 640MHz spec the converter loop noise grows
+     * faster than the oversampling ratio gains. */
+    bool adc_oc = false;
+    {
+        const char *s = getenv("M2SDR_OC_ADC_OC");
+        if (s != NULL && strtoul(s, NULL, 0)) {
+            uint32_t parent = clk_get_rate(phy, phy->ref_clk_scale[BB_REFCLK]);
+
+            if (ad9361_bbpll_set_rate(phy->ref_clk_scale[BBPLL_CLK],
+                                      1474560000U, parent) == 0) {
+                adc_oc = true;
+                /* DAC = ADC/2 (368.64MHz with Tx INT3). */
+                ad9361_spi_writef(phy->spi, REG_BBPLL, BIT(3), 1);
+                printf("RFIC overclock: ADC overclock on (BBPLL 1474.56MHz locked, ADC 737.28, dec6).\n");
+            } else {
+                (void)ad9361_bbpll_set_rate(phy->ref_clk_scale[BBPLL_CLK],
+                                            983040000U, parent);
+                printf("RFIC overclock: BBPLL 1474.56MHz FAILED to lock, staying at 983.04.\n");
+            }
+        }
+    }
+
     {
         /* Bits [7:6] of 0x002/0x003 are the TX/RX channel enables and select
          * the LVDS framing (UG-570 Table 50); they are preserved here - the
@@ -7619,10 +7648,12 @@ void ad9361_enable_oversampling(struct ad9361_rf_phy *phy)
                        fir_file, n);
             }
         }
-        ad9361_spi_write(phy->spi, 0x003, (rx_ctrl & 0xC0) | 0x14 | rx_fir);
+        ad9361_spi_write(phy->spi, 0x003,
+            (rx_ctrl & 0xC0) | (adc_oc ? 0x24 : 0x14) | rx_fir);
         /* 0x002 (Tx Enable & Filter Ctrl) low bits 0x00: all THB stages and
-         * the TX FIR bypassed - the DAC runs directly at the port rate. */
-        ad9361_spi_write(phy->spi, 0x002, (tx_ctrl & 0xC0) | 0x00);
+         * the TX FIR bypassed - the DAC runs directly at the port rate (with
+         * the ADC overclock: THB3 in INT3 mode, DAC at 3x the port rate). */
+        ad9361_spi_write(phy->spi, 0x002, (tx_ctrl & 0xC0) | (adc_oc ? 0x20 : 0x00));
     }
 
     /* Baseband filters: the default is the chip-native wide tune (the chip's
@@ -7700,6 +7731,26 @@ void ad9361_enable_oversampling(struct ad9361_rf_phy *phy)
                                                   * disabled recipe's artifact. */
         ad9361_spi_write(phy->spi, 0x1ef, 0x00); /* RX BBF CC2 ctr -> 0.  */
         ad9361_spi_write(phy->spi, 0x1e0, 0xbf); /* RX BBF R1A (re-asserted per doc). */
+    }
+
+    /* The ADC's internal configuration (bias currents, integrator scaling)
+     * is computed from the BBPLL/ADC rates and the calibrated BBF corner;
+     * recompute it for the overclocked rates (must follow the BBF tune,
+     * which sets the C3/R2346 words and rxbbf_div it reads). */
+    if (adc_oc && getenv("M2SDR_OC_NO_ADC_SETUP") == NULL) {
+        ad9361_rx_adc_setup(phy, 1474560000U, 737280000U);
+    } else if (!adc_oc && getenv("M2SDR_OC_ADC_RESETUP") != NULL) {
+        /* Recompute the ADC loop scaling with an assumed BBF divider from
+         * the env (experiment, REJECTED: narrow-assumption configs can look
+         * a few dB better on a no-signal floor but saturate internally
+         * under wideband drive - NPR collapses; the init-time setup is the
+         * right one under signal). */
+        uint32_t bbpll = clk_get_rate(phy, phy->ref_clk_scale[BBPLL_CLK]);
+        uint32_t div = (uint32_t)strtoul(getenv("M2SDR_OC_ADC_RESETUP"), NULL, 0);
+
+        if (div >= 1 && div <= 64)
+            phy->rxbbf_div = div;
+        ad9361_rx_adc_setup(phy, bbpll, bbpll / 2);
     }
 
     /* 0x3F6 (BIST and Data Port Test Config): register map requires the low
