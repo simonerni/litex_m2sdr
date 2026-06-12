@@ -242,8 +242,11 @@ Measured at 3.6 GHz on the internal reference (RX side: clean external transmitt
 | RX passband flatness (with EQ FIR)         | +/-1.2 dB to +/-44 MHz            |
 | No-signal RX floor (rx-gain 55)            | -35.6 dBFS integrated             |
 | RX image rejection (quadrature tracking)   | ~40-43 dBc                        |
+| TX EVM, 50 MHz TM3.1 (flat over tx-att 0-18) | ~5.2-6% RMS                     |
+| TX image rejection (tx-att 0)              | ~44 dBc                           |
+| TX passband flatness (waveform pre-emph.)  | +/-1 dB to +/-46 MHz (from -8 dB) |
 
-The RX EVM bottoms out with the ADC filled to ~-12 dBFS RMS at the lowest rx-gain that gets there (the band-edge noise floor is gain-independent). The remaining mid-band limit is LO phase noise from the reference chain (Si5351 multiplication x94 into the RFPLL); the band-edge limit (beyond ~+/-40 MHz) is the converter's own shaped noise at this oversampling ratio - both are silicon/architecture limits, not configuration. Best EVM is obtained on the internal clock reference; an external 10 MHz reference costs ~6% EVM through the Si5351's higher multiplication ratio (N=84 vs N=34).
+The RX EVM bottoms out with the ADC filled to ~-12 dBFS RMS at the lowest rx-gain that gets there (the band-edge noise floor is gain-independent). TX EVM is constant-dBc (drive-independent over tx-att 0-18). The remaining limit on both sides is LO phase noise from the reference chain (Si5351 multiplication x94 into the RFPLLs); the RX band-edge limit (beyond ~+/-40 MHz) is the converter's own shaped noise at this oversampling ratio - both are silicon/architecture limits, not configuration. TX passband flatness over the full 100 MHz is achieved by waveform pre-emphasis against the measured response (the chip TX FIR is not usable as an equalizer in this mode). Best EVM is obtained on the internal clock reference; an external 10 MHz reference costs ~6% EVM through the Si5351's higher multiplication ratio (N=84 vs N=34).
 
 2T2R @ 122.88 MSPS (DATA_CLK 491.52 MHz) is RX-only: the board's ~300-500 ps lane-to-lane LVDS skew exceeds the 983 Mbps eye, which the gateware compensates per-lane with IDELAYE2 deskew (calibrated automatically at configuration) - the TX direction has no per-lane delay primitive in Artix-7 HR banks. TX at 122.88 MSPS is available in 1T1R.
 
