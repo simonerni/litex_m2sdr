@@ -7650,13 +7650,17 @@ void ad9361_enable_oversampling(struct ad9361_rf_phy *phy)
         }
         ad9361_spi_write(phy->spi, 0x003,
             (rx_ctrl & 0xC0) | (adc_oc ? 0x24 : 0x14) | rx_fir);
-        /* M2SDR_OC_TX_FIR_FILE (experiment, NONFUNCTIONAL in wide mode -
-         * kept for reference): in this mode the chip's TX_SAMPL clock view
-         * differs from the real port rate and the TX FIR degenerates to a
-         * flat scalar equal to its DC gain (measured: shape unchanged,
-         * level dropped by sum-of-taps). Use waveform pre-emphasis for TX
-         * flatness instead (the composite TX BBF + DAC sinc response droops
-         * to ~-8dB over the outer +/-38-49MHz). */
+        /* M2SDR_OC_TX_FIR_FILE: interpolate-by-1 TX FIR as a passband
+         * pre-emphasis equalizer (the composite TX BBF + DAC sinc response
+         * droops to ~-8dB over the outer +/-38-49MHz; measured flat to
+         * +/-1.3dB at +/-42 with the inverse design). IMPORTANT: in this
+         * mode the FIR processes in the 245.76MHz domain (each port sample
+         * seen twice with the interpolation stages bypassed), so the taps
+         * must be designed for fs = 245.76MHz, not the 122.88MHz port rate
+         * - a 122.88-designed filter applies frequency-stretched 2x and
+         * degenerates to its DC gain over the signal band. Same 16-tap
+         * engine limit as the RX FIR. Pre-emphasis costs its peak boost in
+         * maximum output power. */
         uint8_t tx_fir = 0x00;
         const char *tx_fir_file = getenv("M2SDR_OC_TX_FIR_FILE");
         if (tx_fir_file != NULL) {
