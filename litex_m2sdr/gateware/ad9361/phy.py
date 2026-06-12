@@ -13,6 +13,47 @@ from litex.gen import *
 from litex.soc.interconnect.csr import *
 from litex.soc.interconnect     import stream
 
+from litex.soc.cores.clock import S7MMCM
+from litex.soc.cores.clock.xilinx_common import XilinxClocking
+
+
+class S7MMCMFbBufg(S7MMCM):
+    """S7MMCM with its feedback path through a BUFG: the output clocks are then
+    deskewed against a BUFG-buffered copy of the input, i.e. phase-aligned with
+    logic clocked by an ordinary BUFG from the same source (instead of with the
+    input pad), which is what the rfic-domain launch registers ride."""
+    def do_finalize(self):
+        XilinxClocking.do_finalize(self)
+        config = self.compute_config()
+        mmcm_fb_out = Signal()
+        mmcm_fb_in  = Signal()
+        self.params.update(
+            # Global.
+            p_BANDWIDTH = "OPTIMIZED",
+            i_RST       = self.reset,
+            i_PWRDWN    = self.power_down,
+            o_LOCKED    = self.locked,
+
+            # VCO.
+            p_REF_JITTER1     = 0.01,
+            p_CLKIN1_PERIOD   = 1e9/self.clkin_freq,
+            p_CLKFBOUT_MULT_F = config["clkfbout_mult"],
+            p_DIVCLK_DIVIDE   = config["divclk_divide"],
+            i_CLKIN1          = self.clkin,
+            i_CLKFBIN         = mmcm_fb_in,
+            o_CLKFBOUT        = mmcm_fb_out,
+        )
+        self.specials += Instance("BUFG", i_I=mmcm_fb_out, o_O=mmcm_fb_in)
+        for n, clkout in sorted(self.clkouts.items()):
+            if n == 0:
+                self.params["p_CLKOUT{}_DIVIDE_F".format(n)] = config["clkout{}_divide".format(n)]
+            else:
+                self.params["p_CLKOUT{}_DIVIDE".format(n)] = config["clkout{}_divide".format(n)]
+            self.params["p_CLKOUT{}_PHASE".format(n)] = config["clkout{}_phase".format(n)]
+            self.params["o_CLKOUT{}".format(n)]       = clkout.clk
+        self.specials += Instance("MMCME2_ADV", name=self.name or "", **self.params)
+
+
 """
 AD9361 RFIC PHY (Dual Port Full Duplex LVDS Mode).
 
@@ -68,8 +109,16 @@ class AD9361PHY(LiteXModule):
             board's ~300ps lane-to-lane skew leaves no common eye, so per-lane deskew is required.
             Drive rx_idelay_value/rx_idelay_ld from the sys domain to load per-lane tap values
             (requires an IDELAYCTRL with a 200MHz reference in the design).
+        with_tx_phase: Clock each TX data lane's ODDR (and the FB_CLK ODDR) from an MMCM-phased
+            copy of rfic_clk instead of rfic_clk directly, selectable at runtime. The TX
+            direction has no per-lane delay primitive in Artix-7 HR banks; the MMCM's per-output
+            static phase (re-programmable through its DRP, VCO/8 steps) provides the per-lane
+            trim that aligns the 983Mbps TX eyes at 491.52MHz DATA_CLK. FB_CLK's ODDR drives a
+            constant pattern, so its output can be phased across the full bit period (the global
+            search axis); the data lanes accept small forward trims. The MMCM only locks at the
+            491.52MHz DATA_CLK; at other rates leave the bypass selected (ODDRs on rfic_clk).
     """
-    def __init__(self, pads, with_loopback=True, with_rx_idelay=False):
+    def __init__(self, pads, with_loopback=True, with_rx_idelay=False, with_tx_phase=False):
         self.sink    = sink   = stream.Endpoint(phy_layout()) # TX input  stream.
         self.source  = source = stream.Endpoint(phy_layout()) # RX output stream.
         self.control = CSRStorage(fields=[
@@ -320,6 +369,52 @@ class AD9361PHY(LiteXModule):
             )
         ]
 
+        # TX Phase Trim (Oversampling).
+        # -----------------------------
+        # MMCM-phased copies of rfic_clk for the TX ODDRs, with a per-output glitching async
+        # bypass mux back to rfic_clk (used whenever DATA_CLK is not 491.52MHz and the MMCM is
+        # unlocked). Phases are static (0 at build, analyzed as such) and re-programmed at
+        # runtime through the DRP; data-lane trims stay small and forward so the rfic-domain
+        # launch registers keep setup margin into the phased ODDRs.
+        if with_tx_phase:
+            self.tx_phase = CSRStorage(fields=[
+                CSRField("en", size=1, offset=0,
+                    description="Clock the TX ODDRs from the MMCM-phased clocks."),
+                CSRField("mmcm_reset", size=1, offset=1,
+                    description="Hold the TX MMCM in reset (assert around DRP phase writes)."),
+            ])
+            self.tx_mmcm = S7MMCM(speedgrade=-3)
+            # Feed the MMCM and the bypass inputs from the IBUFDS output (dedicated routes);
+            # cascading out of the rfic BUFG is not placeable.
+            self.tx_mmcm.register_clkin(rx_clk_ibufds, 491.52e6)
+            self.comb += self.tx_mmcm.reset.eq(self.tx_phase.fields.mmcm_reset)
+            tx_ph_cds = []
+            for i in range(7):
+                cd_raw = ClockDomain(f"rfic_txphraw{i}", reset_less=True)
+                self.clock_domains += cd_raw
+                self.tx_mmcm.create_clkout(cd_raw, 491.52e6, phase=0, buf=None, with_reset=False)
+                cd_mux = ClockDomain(f"rfic_txph{i}", reset_less=True)
+                self.clock_domains += cd_mux
+                self.specials += Instance("BUFGCTRL",
+                    i_I0      = rx_clk_ibufds,
+                    i_I1      = cd_raw.clk,
+                    i_S0      = ~self.tx_phase.fields.en,
+                    i_S1      = self.tx_phase.fields.en,
+                    i_CE0     = 1,
+                    i_CE1     = 1,
+                    i_IGNORE0 = 1,
+                    i_IGNORE1 = 1,
+                    o_O       = cd_mux.clk,
+                )
+                tx_ph_cds.append(cd_mux)
+            self.tx_mmcm.expose_drp()
+            tx_lane_clk = [cd.clk for cd in tx_ph_cds[:6]]
+            tx_fb_clk   = tx_ph_cds[6].clk
+        else:
+            tx_ph_cds   = None
+            tx_lane_clk = [ClockSignal("rfic") for _ in range(6)]
+            tx_fb_clk   = ClockSignal("rfic")
+
         # TX Clocking.
         # ------------
         # Output: FB_CLK to AD9361, derived from RFIC clock (same frequency as DATA_CLK).
@@ -327,7 +422,7 @@ class AD9361PHY(LiteXModule):
         self.specials += [
             Instance("ODDR",
                 p_DDR_CLK_EDGE = "SAME_EDGE",
-                i_C  = ClockSignal("rfic"),
+                i_C  = tx_fb_clk,
                 i_CE = 1,
                 i_S  = 0,
                 i_R  = 0,
@@ -370,7 +465,12 @@ class AD9361PHY(LiteXModule):
                 })
             )
         ]
+        # The data lanes are re-registered once more in their (phased) clock domains so the
+        # rfic -> phased-domain crossing terminates on fabric flops instead of the IOB-locked
+        # ODDR D pins; the frame gets a matching extra cycle here.
+        tx_frame_r2 = Signal()
         self.sync.rfic += tx_frame_r.eq(tx_frame)
+        self.sync.rfic += tx_frame_r2.eq(tx_frame_r)
         self.specials += [
             Instance("ODDR",
                 p_DDR_CLK_EDGE = "SAME_EDGE",
@@ -378,8 +478,8 @@ class AD9361PHY(LiteXModule):
                 i_CE = 1,
                 i_S  = 0,
                 i_R  = 0,
-                i_D1 = tx_frame_r,
-                i_D2 = tx_frame_r,
+                i_D1 = tx_frame_r2,
+                i_D2 = tx_frame_r2,
                 o_Q  = tx_frame_obufds,
             ),
             Instance("OBUFDS",
@@ -423,16 +523,26 @@ class AD9361PHY(LiteXModule):
             tx_data_half_i_r.eq(tx_data_half_i),
             tx_data_half_q_r.eq(tx_data_half_q),
         ]
+        tx_data_half_i_r2 = Signal(6)
+        tx_data_half_q_r2 = Signal(6)
         for i in range(6):
+            if with_tx_phase:
+                lane_sync = getattr(self.sync, f"rfic_txph{i}")
+            else:
+                lane_sync = self.sync.rfic
+            lane_sync += [
+                tx_data_half_i_r2[i].eq(tx_data_half_i_r[i]),
+                tx_data_half_q_r2[i].eq(tx_data_half_q_r[i]),
+            ]
             self.specials += [
                 Instance("ODDR",
                     p_DDR_CLK_EDGE = "SAME_EDGE",
-                    i_C  = ClockSignal("rfic"),
+                    i_C  = tx_lane_clk[i],
                     i_CE = 1,
                     i_S  = 0,
                     i_R  = 0,
-                    i_D1 = tx_data_half_i_r[i],
-                    i_D2 = tx_data_half_q_r[i],
+                    i_D1 = tx_data_half_i_r2[i],
+                    i_D2 = tx_data_half_q_r2[i],
                     o_Q  = tx_data_obufds[i],
                 ),
                 Instance("OBUFDS",

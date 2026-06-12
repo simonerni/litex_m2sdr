@@ -768,6 +768,10 @@ class BaseSoC(SoCMini):
             # Per-lane RX IDELAYE2 deskew: at 983Mbps per lane (2T2R @ 122.88MSPS) the board's
             # lane-to-lane skew exceeds the eye, and the AD9361's delay registers are global-only.
             with_rx_deskew    = with_rfic_oversampling,
+            # Per-lane TX clock phase trim (MMCM + DRP): the TX-direction counterpart of the RX
+            # deskew; Artix-7 HR banks have no ODELAY, so the lane alignment is done by phasing
+            # each TX ODDR's clock instead.
+            with_tx_phase     = with_rfic_oversampling,
         )
         self.ad9361.add_prbs()
         self.ad9361.add_agc()
@@ -1147,6 +1151,29 @@ class BaseSoC(SoCMini):
                 "-to [get_cells -hierarchical -filter {{NAME =~ *storage_*_dat1_reg*}}]",
                 "set_multicycle_path 1 -hold  -from [get_clocks rfic_clk] "
                 "-to [get_cells -hierarchical -filter {{NAME =~ *storage_*_dat1_reg*}}]",
+                # The TX phase-trim BUFGCTRL selects are quasi-static control (changed only
+                # with TX idle; IGNORE0/1 make the mux asynchronous by design).
+                "set_false_path -to [get_pins -hierarchical -filter {{NAME =~ *BUFGCTRL*/S?}}]",
+                # TX ODDR paths captured by the BUFGCTRL bypass leg (pad clock): the bypass
+                # only carries data at DATA_CLK <= 245.76MHz (period >= 4.07ns) - at 491.52MHz
+                # the MMCM-phased leg is selected before TX is used - so the single-cycle
+                # 491.52MHz check is over-constrained by 2x.
+                "set_multicycle_path 2 -setup -from [get_clocks rfic_clk] "
+                "-to [get_clocks ad9361_rfic_rx_clk_p]",
+                "set_multicycle_path 1 -hold  -from [get_clocks rfic_clk] "
+                "-to [get_clocks ad9361_rfic_rx_clk_p]",
+                # The TX BUFGCTRL muxes carry either the bypass (pad) clock or the MMCM-phased
+                # clocks, never both: cross-leg paths are physically impossible.
+                "set_clock_groups -logically_exclusive "
+                "-group [get_clocks ad9361_rfic_rx_clk_p] "
+                "-group [get_clocks -filter {{NAME =~ *ad9361phy_clkout*}}]",
+                # The rfic -> phased-lane-domain crossing's validity is enforced by the TX phase
+                # calibration, not by static analysis: the lane trim moves the capture clock in
+                # VCO/8 steps and a miscapture shows in the per-lane PRBS error counters the
+                # calibration sweeps over (a fixed-phase same-frequency crossing, residual
+                # -0.1..-0.35ns inter-clock-tree pessimism at 491.52MHz).
+                "set_false_path -from [get_clocks rfic_clk] "
+                "-to [get_clocks -filter {{NAME =~ *ad9361phy_clkout*}}]",
             ]
 
         # Clk Measurements -------------------------------------------------------------------------

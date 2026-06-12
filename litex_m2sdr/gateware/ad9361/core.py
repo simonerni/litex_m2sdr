@@ -97,7 +97,8 @@ class AD9361RFIC(LiteXModule):
         with_tx_fifo      = False, tx_fifo_depth = 8192,
         with_rx_fifo      = False, rx_fifo_depth = 8192,
         with_phy_loopback = True,
-        with_rx_deskew    = False):
+        with_rx_deskew    = False,
+        with_tx_phase     = False):
         # Controls ---------------------------------------------------------------------------------
         self.enable_datapath = Signal(reset=1)
 
@@ -165,7 +166,8 @@ class AD9361RFIC(LiteXModule):
         ]
 
         # PHY --------------------------------------------------------------------------------------
-        self.phy = AD9361PHY(rfic_pads, with_loopback=with_phy_loopback, with_rx_idelay=with_rx_deskew)
+        self.phy = AD9361PHY(rfic_pads, with_loopback=with_phy_loopback, with_rx_idelay=with_rx_deskew,
+            with_tx_phase=with_tx_phase)
         if with_rx_deskew:
             self.add_rx_deskew()
 
