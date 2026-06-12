@@ -1198,6 +1198,38 @@ static int m2sdr_wide_bandwidth_bringup(struct m2sdr_dev *dev,
                     (void)m2sdr_tune_tx_delay(dev, phy);
             }
 #endif
+            /* RX quadrature tracking loop gain: at the driver default
+             * (K exp 0x15) the loop is effectively inert in this mode and
+             * the image rejection settles at ~23-28dBc - a direct 3.5-7%
+             * EVM floor. K exp 0x0a converges to ~40-43dBc (measured;
+             * stable from 0x02 to 0x0a). M2SDR_QEC_KEXP overrides. */
+            {
+                const char *s = getenv("M2SDR_QEC_KEXP");
+                uint8_t kexp = s ? (uint8_t)strtoul(s, NULL, 0) & 0x1F : 0x0a;
+
+                ad9361_spi_write(phy->spi, REG_CALIBRATION_CONFIG_2,
+                    CALIBRATION_CONFIG2_DFLT | K_EXP_PHASE(kexp));
+                ad9361_spi_write(phy->spi, REG_CALIBRATION_CONFIG_3,
+                    PREVENT_POS_LOOP_GAIN | K_EXP_AMPLITUDE(kexp));
+            }
+            /* RX RFPLL loop peaking: the LUT charge-pump current leaves a
+             * ~5dB skirt bump at 1-3MHz offsets (measured); half the current
+             * removes it (integrated 10k-10M phase noise -21.5 -> -24dBc).
+             * M2SDR_RFPLL_CP_PERCENT overrides (100 = LUT value). */
+            {
+                const char *s = getenv("M2SDR_RFPLL_CP_PERCENT");
+                unsigned pct = s ? (unsigned)strtoul(s, NULL, 0) : 50;
+                uint8_t cp = ad9361_spi_read(phy->spi, REG_RX_CP_CURRENT);
+                uint8_t icp = cp & CHARGE_PUMP_CURRENT(~0);
+                uint8_t nicp = (uint8_t)((icp * pct + 50) / 100);
+
+                if (nicp < 1)
+                    nicp = 1;
+                if (nicp > CHARGE_PUMP_CURRENT(~0))
+                    nicp = CHARGE_PUMP_CURRENT(~0);
+                ad9361_spi_write(phy->spi, REG_RX_CP_CURRENT,
+                    (cp & ~CHARGE_PUMP_CURRENT(~0)) | nicp);
+            }
             return M2SDR_ERR_OK;
         }
     }
