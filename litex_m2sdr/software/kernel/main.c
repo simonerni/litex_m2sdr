@@ -573,6 +573,14 @@ static int litepcie_dma_init(struct litepcie_device *s)
 	return 0;
 }
 
+/* DMA buffers per MSI interrupt. Lower makes the host see writer/reader hw_count
+ * advance sooner (lower RX/TX DMA completion latency) at the cost of more
+ * interrupts; 1 = an MSI per buffer. Default keeps the historical coalescing. */
+static unsigned int dma_buffer_per_irq = DMA_BUFFER_PER_IRQ;
+module_param(dma_buffer_per_irq, uint, 0644);
+MODULE_PARM_DESC(dma_buffer_per_irq,
+	"DMA buffers per MSI interrupt: lower = lower DMA latency, more IRQs (1 = per buffer)");
+
 /* Start DMA writer for a specific channel */
 static void litepcie_dma_writer_start(struct litepcie_device *s, int chan_num)
 {
@@ -591,7 +599,7 @@ static void litepcie_dma_writer_start(struct litepcie_device *s, int chan_num)
 #ifndef DMA_BUFFER_ALIGNED
 			DMA_LAST_DISABLE |
 #endif
-			(!(i % DMA_BUFFER_PER_IRQ == 0)) * DMA_IRQ_DISABLE | /* Generate an MSI every n buffers */
+			(!(i % (dma_buffer_per_irq ? dma_buffer_per_irq : 1) == 0)) * DMA_IRQ_DISABLE | /* MSI every dma_buffer_per_irq buffers */
 			DMA_BUFFER_SIZE);
 		/* Fill 32-bit Address LSB */
 		litepcie_writel(s, dmachan->base + PCIE_DMA_WRITER_TABLE_VALUE_OFFSET + 4, (dmachan->writer_handle[i] >>  0) & 0xffffffff);
@@ -665,7 +673,7 @@ static void litepcie_dma_reader_start(struct litepcie_device *s, int chan_num)
 #ifndef DMA_BUFFER_ALIGNED
 			DMA_LAST_DISABLE |
 #endif
-			(!(i % DMA_BUFFER_PER_IRQ == 0)) * DMA_IRQ_DISABLE | /* Generate an MSI every n buffers */
+			(!(i % (dma_buffer_per_irq ? dma_buffer_per_irq : 1) == 0)) * DMA_IRQ_DISABLE | /* MSI every dma_buffer_per_irq buffers */
 			DMA_BUFFER_SIZE);
 		/* Fill 32-bit Address LSB */
 		litepcie_writel(s, dmachan->base + PCIE_DMA_READER_TABLE_VALUE_OFFSET + 4, (dmachan->reader_handle[i] >>  0) & 0xffffffff);
@@ -1153,7 +1161,7 @@ static unsigned int litepcie_poll(struct file *file, poll_table *wait)
 		chan->dma.reader_hw_count, chan->dma.reader_sw_count);
 #endif
 
-	if ((chan->dma.writer_hw_count - chan->dma.writer_sw_count) > 2)
+	if ((chan->dma.writer_hw_count - chan->dma.writer_sw_count) > 0)
 		mask |= POLLIN | POLLRDNORM;
 
 	if ((chan->dma.reader_sw_count - chan->dma.reader_hw_count) < DMA_BUFFER_COUNT/2)
